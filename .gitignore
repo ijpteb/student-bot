@@ -1,0 +1,11 @@
+# Секреты — никогда не в git
+.env
+*.env
+!.env.example
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+# macOS
+.DS_Store

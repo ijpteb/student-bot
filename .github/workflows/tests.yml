@@ -1,0 +1,35 @@
+# Автотесты при каждом обновлении кода (бесплатно для этого репозитория).
+name: Тесты
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: bot
+          POSTGRES_PASSWORD: bot
+          POSTGRES_DB: bot_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U bot" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: pip install -r requirements-dev.txt
+      - name: Тесты на SQLite
+        run: pytest -q
+      - name: Тесты на PostgreSQL
+        env:
+          TEST_DATABASE_URL: postgresql+asyncpg://bot:bot@localhost:5432/bot_test
+        run: pytest -q
+      - name: Миграции применяются к чистой базе
+        env:
+          DATABASE_URL: postgresql+asyncpg://bot:bot@localhost:5432/bot_test
+        run: alembic upgrade head && alembic check
