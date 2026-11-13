@@ -2,6 +2,7 @@ import asyncio
 from logging.config import fileConfig
 
 from sqlalchemy import pool
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
@@ -74,8 +75,21 @@ async def run_async_migrations() -> None:
         poolclass=pool.NullPool,
     )
 
-    async with connectable.connect() as connection:
+    # База может ещё запускаться (первый запуск, перезагрузка Mac) — ждём подключения до минуты.
+    for attempt in range(30):
+        try:
+            connection = await connectable.connect()
+            break
+        except (OSError, DBAPIError):
+            if attempt == 29:
+                raise
+            if attempt == 0:
+                print("Жду, пока запустится база данных…", flush=True)
+            await asyncio.sleep(2)
+    try:
         await connection.run_sync(do_run_migrations)
+    finally:
+        await connection.close()
 
     await connectable.dispose()
 

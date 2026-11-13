@@ -53,8 +53,12 @@ async def rename(session: AsyncSession, subject: Subject, name: str) -> None:
 
 async def usage(session: AsyncSession, subject: Subject) -> tuple[int, int]:
     """Сколько пар и заданий удалится вместе с предметом."""
-    lessons = await session.scalar(select(func.count()).where(Lesson.subject_id == subject.id))
-    hw = await session.scalar(select(func.count()).where(Homework.subject_id == subject.id))
+    lessons = await session.scalar(
+        select(func.count()).where(Lesson.subject_id == subject.id, Lesson.user_id == subject.user_id)
+    )
+    hw = await session.scalar(
+        select(func.count()).where(Homework.subject_id == subject.id, Homework.user_id == subject.user_id)
+    )
     return lessons or 0, hw or 0
 
 

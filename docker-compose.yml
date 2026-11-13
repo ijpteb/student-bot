@@ -9,7 +9,8 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U bot -d bot"]
+      # Проверяем по сети (-h 127.0.0.1): при первом запуске база недолго работает только «внутри себя».
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U bot -d bot"]
       interval: 5s
       timeout: 5s
       retries: 10

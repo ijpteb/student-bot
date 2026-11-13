@@ -4,10 +4,16 @@ import asyncio
 import logging
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from bot.messenger import RecipientUnavailable
+from bot.messenger import MessageRejected, RecipientUnavailable, TemporaryFailure
 from bot.models import Attachment, User
 from bot.telegram.kb import HwCb
 
@@ -20,6 +26,7 @@ class TelegramNotifier:
         self.admin_id = admin_id
 
     async def _call(self, coro_factory):
+        """Ошибки Telegram переводим в понятные ядру: недоступен получатель / нет связи / отказ."""
         for attempt in range(2):
             try:
                 return await coro_factory()
@@ -28,11 +35,13 @@ class TelegramNotifier:
             except TelegramBadRequest as e:
                 if "chat not found" in str(e).lower():
                     raise RecipientUnavailable() from e
-                raise
+                raise MessageRejected(type(e).__name__) from e
+            except (TelegramNetworkError, TelegramServerError) as e:
+                raise TemporaryFailure(type(e).__name__) from e
             except TelegramRetryAfter as e:
                 if attempt:
-                    raise
-                await asyncio.sleep(e.retry_after)
+                    raise TemporaryFailure("TelegramRetryAfter") from e
+                await asyncio.sleep(min(e.retry_after, 60))
 
     async def send_text(self, user: User, text: str, homework_id: int | None = None) -> None:
         markup = None

@@ -5,7 +5,7 @@
 """
 
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,7 +15,8 @@ from bot.models import Homework, Reminder, User
 
 # Если бот был выключен во время сводки, она придёт позже, но не позднее этого срока.
 DIGEST_GRACE = timedelta(hours=3)
-# Сколько раз пробовать отправить напоминание при сбоях связи.
+# Сколько раз пробовать отправить напоминание при неожиданной ошибке (не при пропаже связи:
+# тогда напоминание просто ждёт, пока связь вернётся).
 MAX_ATTEMPTS = 5
 
 
@@ -75,27 +76,38 @@ def should_skip(item: DueReminder) -> bool:
     return item.homework.done or not item.user.reminders_enabled or item.user.blocked
 
 
+def _digest_slot(user: User, now_l: datetime) -> datetime:
+    """Последнее наступившее время сводки: сегодняшнее или, если оно ещё впереди, вчерашнее."""
+    target = datetime.combine(now_l.date(), user.digest_time)
+    return target - timedelta(days=1) if target > now_l else target
+
+
 def digest_due(user: User, now: datetime) -> bool:
-    """Пора ли отправить ежедневную сводку (без учёта того, есть ли задания)."""
+    """Пора ли отправить ежедневную сводку (без учёта того, есть ли задания).
+    Опоздавшая сводка (бот был выключен) приходит в течение 3 часов, даже после полуночи."""
     if not user.digest_enabled or user.blocked:
         return False
     now_l = local_now(user.timezone, now)
-    if user.last_digest_date == now_l.date():
-        return False
-    target = datetime.combine(now_l.date(), user.digest_time)
-    return target <= now_l < target + DIGEST_GRACE
+    slot = _digest_slot(user, now_l)
+    return user.last_digest_date != slot.date() and now_l < slot + DIGEST_GRACE
 
 
 def mark_digest(user: User, now: datetime) -> None:
-    user.last_digest_date = local_now(user.timezone, now).date()
+    user.last_digest_date = _digest_slot(user, local_now(user.timezone, now)).date()
 
 
-def reminder_presets(due_date, now_local: datetime) -> list[tuple[str, datetime]]:
-    """Готовые варианты напоминания для кнопок (только те, что ещё впереди)."""
+def reminder_presets(
+    due_date: date | None, due_time: time | None, now_local: datetime
+) -> list[tuple[str, datetime]]:
+    """Готовые варианты напоминания для кнопок: только те, что ещё впереди и раньше срока сдачи."""
     if due_date is None:
         return []
+    deadline = datetime.combine(due_date, due_time) if due_time else None
     options = [
         ("Накануне в 20:00", datetime.combine(due_date - timedelta(days=1), time(20, 0))),
         ("В день сдачи в 8:00", datetime.combine(due_date, time(8, 0))),
     ]
-    return [(label, dt) for label, dt in options if dt > now_local]
+    return [
+        (label, dt) for label, dt in options
+        if dt > now_local and (deadline is None or dt < deadline)
+    ]

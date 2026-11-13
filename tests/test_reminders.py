@@ -194,7 +194,9 @@ async def test_delete_user_data(sessionmaker):
         user, hw = await _hw(session)
         await reminders.set_reminder(session, user, hw, datetime(2026, 11, 15, 20, 0))
         await add_university_request(session, user, "ИМЭС")
+        await add_university_request(session, user, "Петров Пётр, тел 89991234567")  # случайный текст
         other, _ = await _hw(session, ext="2")
+        await add_university_request(session, other, "имэс")
         await session.commit()
         await delete_user_data(session, user)
         await session.commit()
@@ -202,4 +204,6 @@ async def test_delete_user_data(sessionmaker):
         assert await session.scalar(select(func.count()).select_from(Homework)) == 1
         assert await session.scalar(select(func.count()).select_from(Subject)) == 1
         assert await session.scalar(select(func.count()).select_from(Reminder)) == 0
-        assert await request_counts(session) == [("ИМЭС", 1)]  # счётчик заявок сохранён без привязки
+        # Счётчик по вузу, который просили и другие, сохранён без привязки к удалённому студенту,
+        # а уникальный текст (мог быть чем угодно, вплоть до личных данных) удалён.
+        assert await request_counts(session) == [("ИМЭС", 2)]

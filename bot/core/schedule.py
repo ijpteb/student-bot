@@ -145,6 +145,10 @@ async def add_lesson(
         raise ScheduleError("Нужен либо день недели, либо дата")
     if end <= start:
         raise ScheduleError("Конец пары должен быть позже начала.")
+    # Предмет должен быть своим: id приходит из диалога и мог устареть (предмет удалён).
+    owner = await session.scalar(select(Subject.user_id).where(Subject.id == subject_id))
+    if owner != user_id:
+        raise ScheduleError("Предмет не найден — возможно, его удалили. Начните добавление пары заново.")
     lesson = Lesson(
         user_id=user_id,
         subject_id=subject_id,

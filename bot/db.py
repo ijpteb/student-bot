@@ -3,6 +3,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async
 
 
 def make_engine(url: str, **kwargs) -> AsyncEngine:
+    # Значения из запросов (то, что вводят студенты) не попадают в тексты ошибок и журнал.
+    kwargs.setdefault("hide_parameters", True)
     engine = create_async_engine(url, **kwargs)
     if engine.dialect.name == "sqlite":
         # В SQLite связи между таблицами (каскадное удаление) включаются отдельно.

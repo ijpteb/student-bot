@@ -10,11 +10,22 @@ from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from bot.core import reminders
 from bot.core import users as users_core
-from bot.core.timeutil import RU_TIMEZONES, ParseError, fmt_date, fmt_time, monday_of, parse_date, parse_time, tz_label
+from bot.core.timeutil import (
+    RU_TIMEZONES,
+    ParseError,
+    fmt_date,
+    fmt_time,
+    monday_of,
+    now_utc,
+    parse_date,
+    parse_time,
+    tz_label,
+)
 from bot.models import User
 from bot.telegram import kb
-from bot.telegram.ui import show, today, week1
+from bot.telegram.ui import answer_cb, show, today, week1
 
 router = Router(name="settings")
 NOT_MENU = ~F.text.in_(kb.MENU_BUTTONS) & ~F.text.startswith("/")
@@ -37,7 +48,7 @@ async def _show_settings(event, user: User) -> None:
         f"🕗 Ежедневная сводка заданий: {fmt_time(user.digest_time) + ', ' if user.digest_enabled else ''}{_on(user.digest_enabled)}\n"
         f"🔔 Напоминания о заданиях: {_on(user.reminders_enabled)}\n"
         f"🌍 Часовой пояс: {tz_label(user.timezone)}\n"
-        f"🔢 Первая (нечётная) неделя семестра начинается {fmt_date(w1)} {w1.year}\n"
+        f"🔢 Первая (нечётная) неделя семестра начинается {fmt_date(w1, year=True)}\n"
         f"🏫 Вуз: {escape(user.university_name) if user.university_name else 'не указан'} — ручной режим"
     )
     b = InlineKeyboardBuilder()
@@ -74,17 +85,19 @@ def _back(b: InlineKeyboardBuilder) -> None:
 
 @router.callback_query(kb.Nav.filter(F.to == "set_digest"))
 async def digest_menu(cb: CallbackQuery, state: FSMContext, user: User) -> None:
-    await state.set_state(SettingsInput.digest_time)
     b = InlineKeyboardBuilder()
     b.button(text="Выключить сводку" if user.digest_enabled else "Включить сводку", callback_data=kb.Pick(kind="dg", value="toggle"))
     for t in ("07:00", "08:00", "18:00", "20:00", "21:00", "22:00"):
-        b.button(text=t, callback_data=kb.Pick(kind="dg", value=t))
+        # В данных кнопки нельзя двоеточие — время передаём как 0700.
+        b.button(text=t, callback_data=kb.Pick(kind="dg", value=t.replace(":", "")))
     _back(b)
     b.adjust(1, 3, 3, 1)
+    await state.set_state(SettingsInput.digest_time)
     await show(
         cb,
         "Каждый день в выбранное время я присылаю список невыполненных заданий. "
-        "Если заданий нет — сводка не приходит.\n\nВыберите время или напишите своё, например <code>19:30</code>.",
+        "Если заданий нет — сводка не приходит.\n\nВыберите время или напишите своё, например <code>19:30</code>.\n"
+        f"<i>Время — {tz_label(user.timezone)}.</i>",
         b.as_markup(),
     )
 
@@ -93,7 +106,9 @@ async def _set_digest_time(event, state: FSMContext, user: User, value: str) -> 
     t = parse_time(value)
     if t != user.digest_time:
         user.digest_time = t
-        user.last_digest_date = None  # чтобы сводка пришла уже сегодня в новое время
+        # Уже прошедшее новое время сегодня (или вчера) считаем отработанным: сводка придёт
+        # в ближайшее наступление нового времени, а не сразу.
+        reminders.mark_digest(user, now_utc())
     user.digest_enabled = True
     await state.clear()
     await _show_settings(event, user)
@@ -106,7 +121,8 @@ async def digest_pick(cb: CallbackQuery, callback_data: kb.Pick, state: FSMConte
         await state.clear()
         await _show_settings(cb, user)
         return
-    await _set_digest_time(cb, state, user, callback_data.value)
+    v = callback_data.value  # «0700»
+    await _set_digest_time(cb, state, user, f"{v[:2]}:{v[2:]}")
 
 
 @router.message(SettingsInput.digest_time, F.text, NOT_MENU)
@@ -173,7 +189,8 @@ async def week1_default(cb: CallbackQuery, state: FSMContext, user: User) -> Non
 @router.message(SettingsInput.week1, F.text, NOT_MENU)
 async def week1_text(message: Message, state: FSMContext, user: User) -> None:
     try:
-        d = parse_date(message.text, today(user))
+        # Начало семестра обычно уже в прошлом: «01.09» в ноябре — это 1 сентября этого года.
+        d = parse_date(message.text, today(user), mode="nearest")
     except ParseError as e:
         await message.answer(str(e))
         return
@@ -223,8 +240,13 @@ async def delete_me(event: Message | CallbackQuery, state: FSMContext) -> None:
 
 
 @router.callback_query(kb.Nav.filter(F.to == "delete_me_ok"))
-async def delete_me_ok(cb: CallbackQuery, session: AsyncSession, user: User) -> None:
+async def delete_me_ok(cb: CallbackQuery, state: FSMContext, session: AsyncSession, user: User) -> None:
+    await state.clear()  # вместе с базой забываем и недописанный ввод
     await users_core.delete_user_data(session, user)
-    await cb.message.edit_text("Все ваши данные удалены.")
-    await cb.message.answer("Чтобы начать заново, нажмите /start.", reply_markup=ReplyKeyboardRemove())
-    await cb.answer()
+    await session.commit()  # удаляем до ответа в Telegram: сбой ответа не должен вернуть данные
+    if isinstance(cb.message, Message):
+        await show(cb, "Все ваши данные удалены.")
+    else:
+        await answer_cb(cb, "Все ваши данные удалены.")
+    if cb.message is not None:
+        await cb.message.answer("Чтобы начать заново, нажмите /start.", reply_markup=ReplyKeyboardRemove())

@@ -7,7 +7,7 @@ from aiogram import F, Router
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,6 +17,7 @@ from bot.core import subjects as subj
 from bot.core.timeutil import (
     PARITY_NAMES,
     WEEKDAYS,
+    WEEKDAYS_ACC,
     WEEKDAYS_SHORT,
     ParseError,
     fmt_date,
@@ -25,15 +26,17 @@ from bot.core.timeutil import (
     parse_date,
     parse_time,
     parse_time_range,
+    parse_weekday,
 )
 from bot.models import User
 from bot.telegram import kb
-from bot.telegram.ui import now_l, show, today, week1
+from bot.telegram.ui import MAX_LEN, answer_cb, now_l, show, today, week1
 
 router = Router(name="schedule")
 
 PARITY_SHORT = {0: "", 1: " (неч.)", 2: " (чёт.)"}
 NOT_MENU = ~F.text.in_(kb.MENU_BUTTONS) & ~F.text.startswith("/")
+EMPTY_HINT = "\n\n<i>Расписание пока не внесено.</i>"
 
 
 async def _load(session: AsyncSession, user: User) -> sch.Schedule:
@@ -48,8 +51,8 @@ def _day_markup(day: date, empty_schedule: bool):
     b.button(text="▶️", callback_data=kb.DayCb(action="show", day=(day + timedelta(days=1)).isoformat()))
     if empty_schedule:
         b.button(text="✏️ Внести расписание", callback_data=kb.Nav(to="sched"))
-    else:
-        b.button(text="✏️ Изменения на этот день", callback_data=kb.DayCb(action="edit", day=day.isoformat()))
+    # Разовую пару (консультация, экзамен) можно добавить и в пустое расписание.
+    b.button(text="✏️ Изменения на этот день", callback_data=kb.DayCb(action="edit", day=day.isoformat()))
     b.adjust(2, 1)
     return b.as_markup()
 
@@ -58,7 +61,7 @@ async def _show_day(event, session: AsyncSession, user: User, day: date, title: 
     s = await _load(session, user)
     text = render.day_text(day, s.day(day), s.week1, title)
     if not s.lessons:
-        text += "\n\n<i>Расписание пока не внесено.</i>"
+        text += EMPTY_HINT
     await show(event, text, _day_markup(day, not s.lessons))
 
 
@@ -84,26 +87,34 @@ async def day_cb(cb: CallbackQuery, callback_data: kb.DayCb, session: AsyncSessi
     await _show_day(cb, session, user, day, title)
 
 
-def _week_markup(day: date):
+def _week_markup(day: date, empty_schedule: bool = False):
     b = InlineKeyboardBuilder()
     b.button(text="◀️ Пред. неделя", callback_data=kb.DayCb(action="week", day=(day - timedelta(days=7)).isoformat()))
     b.button(text="След. неделя ▶️", callback_data=kb.DayCb(action="week", day=(day + timedelta(days=7)).isoformat()))
+    if empty_schedule:
+        b.button(text="✏️ Внести расписание", callback_data=kb.Nav(to="sched"))
+    b.adjust(2, 1)
     return b.as_markup()
+
+
+async def _show_week(event, session: AsyncSession, user: User, day: date) -> None:
+    s = await _load(session, user)
+    text = render.week_text(s, day, max_len=MAX_LEN - 100)
+    if not s.lessons:
+        text += EMPTY_HINT
+    await show(event, text, _week_markup(day, not s.lessons))
 
 
 @router.message(F.text == kb.WEEK, StateFilter("*"))
 @router.message(Command("week"), StateFilter("*"))
 async def week_cmd(message: Message, state: FSMContext, session: AsyncSession, user: User) -> None:
     await state.clear()
-    s = await _load(session, user)
-    await show(message, render.week_text(s, today(user)), _week_markup(today(user)))
+    await _show_week(message, session, user, today(user))
 
 
 @router.callback_query(kb.DayCb.filter(F.action == "week"))
 async def week_cb(cb: CallbackQuery, callback_data: kb.DayCb, session: AsyncSession, user: User) -> None:
-    day = date.fromisoformat(callback_data.day)
-    s = await _load(session, user)
-    await show(cb, render.week_text(s, day), _week_markup(day))
+    await _show_week(cb, session, user, date.fromisoformat(callback_data.day))
 
 
 @router.message(F.text == kb.NEXT, StateFilter("*"))
@@ -111,6 +122,11 @@ async def week_cb(cb: CallbackQuery, callback_data: kb.DayCb, session: AsyncSess
 async def next_cmd(message: Message, state: FSMContext, session: AsyncSession, user: User) -> None:
     await state.clear()
     s = await _load(session, user)
+    if not s.lessons:
+        b = InlineKeyboardBuilder()
+        b.button(text="✏️ Внести расписание", callback_data=kb.Nav(to="sched"))
+        await message.answer("Расписание пока не внесено — внесите его, и я буду показывать ближайшую пару.", reply_markup=b.as_markup())
+        return
     now = now_l(user)
     await message.answer(render.next_lesson_text(s.next_lesson(now), now))
 
@@ -136,7 +152,7 @@ async def _show_day_edit(event, session: AsyncSession, user: User, day: date) ->
     b.button(text="⬅️ Назад", callback_data=kb.DayCb(action="show", day=day.isoformat()))
     b.adjust(1)
     text = (
-        f"<b>Изменения на {WEEKDAYS[day.weekday()].lower()}, {fmt_date(day)}</b>\n\n"
+        f"<b>Изменения на {WEEKDAYS_ACC[day.weekday()]}, {fmt_date(day)}</b>\n\n"
         "Отмена действует только в этот день, остальные недели не меняются. "
         "Перенос пары = отмена + разовая пара в другой день."
     )
@@ -153,7 +169,7 @@ async def lesson_cancel(cb: CallbackQuery, callback_data: kb.LessonCb, session: 
     lesson = await sch.get_lesson(session, user.id, callback_data.id)
     day = date.fromisoformat(callback_data.day)
     if lesson is None:
-        await cb.answer("Пара не найдена", show_alert=True)
+        await answer_cb(cb, "Пара не найдена — возможно, её удалили.", show_alert=True)
         return
     if callback_data.action == "cancel":
         await sch.cancel_on(session, lesson, day)
@@ -164,7 +180,7 @@ async def lesson_cancel(cb: CallbackQuery, callback_data: kb.LessonCb, session: 
 
 # ---------------- Редактор расписания ----------------
 
-async def _show_editor(event, session: AsyncSession, user: User) -> None:
+async def _show_editor(event, session: AsyncSession, user: User, toast: str | None = None) -> None:
     s = await _load(session, user)
     lessons = s.recurring()
     b = InlineKeyboardBuilder()
@@ -176,19 +192,24 @@ async def _show_editor(event, session: AsyncSession, user: User) -> None:
         )
     b.button(text="📖 Предметы", callback_data=kb.Nav(to="subjects"))
     b.adjust(1)
+    one_off_hint = (
+        "Разовые пары (консультации, экзамены) и отмены — через 📅 Сегодня/Завтра → "
+        "«✏️ Изменения на этот день»."
+    )
     if lessons:
         text = (
             "<b>Расписание по дням недели</b>\n"
-            "Нажмите на пару, чтобы удалить её или ограничить сроки. "
-            "Разовые пары и отмены — через кнопку «✏️ Изменения на этот день» под расписанием дня."
+            "Нажмите на пару, чтобы удалить её или ограничить сроки.\n" + one_off_hint
         )
+    elif s.lessons:
+        text = "<b>Еженедельных пар пока нет</b> — есть только разовые.\n" + one_off_hint
     else:
         text = (
             "<b>Расписание пока пустое.</b>\n"
             "Добавляйте пары по одной: предмет, день недели, время, чётность недели. "
-            "Это делается один раз на семестр."
+            "Это делается один раз на семестр.\n" + one_off_hint
         )
-    await show(event, text, b.as_markup())
+    await show(event, text, b.as_markup(), toast=toast)
 
 
 @router.callback_query(kb.Nav.filter(F.to == "sched"), StateFilter("*"))
@@ -201,7 +222,7 @@ async def editor_cb(cb: CallbackQuery, state: FSMContext, session: AsyncSession,
 async def lesson_open(cb: CallbackQuery, callback_data: kb.LessonCb, session: AsyncSession, user: User) -> None:
     lesson = await sch.get_lesson(session, user.id, callback_data.id)
     if lesson is None:
-        await cb.answer("Пара не найдена", show_alert=True)
+        await answer_cb(cb, "Пара не найдена — возможно, её удалили.", show_alert=True)
         return
     s = await _load(session, user)
     lines = [
@@ -214,9 +235,9 @@ async def lesson_open(cb: CallbackQuery, callback_data: kb.LessonCb, session: As
     if lesson.valid_from or lesson.valid_to:
         p = "Действует"
         if lesson.valid_from:
-            p += f" с {fmt_date(lesson.valid_from)}"
+            p += f" с {fmt_date(lesson.valid_from, year=True)}"
         if lesson.valid_to:
-            p += f" по {fmt_date(lesson.valid_to)}"
+            p += f" по {fmt_date(lesson.valid_to, year=True)}"
         lines.append(p)
     b = InlineKeyboardBuilder()
     b.button(text="📆 Сроки действия", callback_data=kb.LessonCb(action="period", id=lesson.id))
@@ -231,29 +252,51 @@ async def lesson_del(cb: CallbackQuery, callback_data: kb.LessonCb, session: Asy
     lesson = await sch.get_lesson(session, user.id, callback_data.id)
     if lesson is not None:
         await sch.delete_lesson(session, lesson)
-    await cb.answer("Пара удалена")
-    await _show_editor(cb, session, user)
+    await _show_editor(cb, session, user, toast="Пара удалена")
 
 
 class LessonPeriod(StatesGroup):
     text = State()
 
 
-@router.callback_query(kb.LessonCb.filter(F.action == "period"))
-async def lesson_period(cb: CallbackQuery, callback_data: kb.LessonCb, state: FSMContext) -> None:
+PERIOD_HELP = (
+    "С какого по какое число идёт эта пара? Напишите, например:\n"
+    "<code>01.09-25.12</code> — с 1 сентября по 25 декабря\n"
+    "<code>-25.12</code> — до 25 декабря\n"
+    "<code>01.10-</code> — с 1 октября\n"
+    "<code>-</code> — без ограничений\n"
+    "<i>Год можно не писать. Если нужно, пишите полностью: 09.02.2027-30.06.2027.</i>"
+)
+
+
+@router.callback_query(kb.LessonCb.filter(F.action == "period"), StateFilter("*"))
+async def lesson_period(cb: CallbackQuery, callback_data: kb.LessonCb, state: FSMContext, session: AsyncSession, user: User) -> None:
+    lesson = await sch.get_lesson(session, user.id, callback_data.id)
+    if lesson is None:
+        await answer_cb(cb, "Пара не найдена — возможно, её удалили.", show_alert=True)
+        return
+    await state.clear()
     await state.set_state(LessonPeriod.text)
-    await state.update_data(lesson_id=callback_data.id)
+    await state.update_data(lesson_id=lesson.id)
     b = InlineKeyboardBuilder()
     kb.cancel_row(b)
-    await show(
-        cb,
-        "С какого по какое число идёт эта пара? Напишите, например:\n"
-        "<code>01.09-25.12</code> — с 1 сентября по 25 декабря\n"
-        "<code>-25.12</code> — до 25 декабря\n"
-        "<code>01.10-</code> — с 1 октября\n"
-        "<code>-</code> — без ограничений",
-        b.as_markup(),
-    )
+    await show(cb, PERIOD_HELP, b.as_markup())
+
+
+def _parse_period(raw: str, today_: date) -> tuple[date | None, date | None]:
+    """«01.09-25.12», «-25.12», «01.10-», «-». Год можно не писать: начало — ближайшая к сегодняшнему
+    дню такая дата (обычно уже прошедшая), конец — первая такая дата после начала."""
+    left, sep, right = raw.strip().partition("-")
+    if not sep:
+        raise ParseError("Не понял. Пример: 01.09-25.12")
+    vfrom = parse_date(left, today_, mode="nearest") if left.strip() else None
+    if right.strip():
+        vto = parse_date(right, vfrom, mode="after") if vfrom else parse_date(right, today_, mode="nearest")
+    else:
+        vto = None
+    if vfrom and vto and vto < vfrom:
+        raise ParseError("Конец раньше начала. Пример: 01.09.2026-25.12.2026")
+    return vfrom, vto
 
 
 @router.message(LessonPeriod.text, F.text, NOT_MENU)
@@ -262,25 +305,24 @@ async def lesson_period_text(message: Message, state: FSMContext, session: Async
     lesson = await sch.get_lesson(session, user.id, data["lesson_id"])
     if lesson is None:
         await state.clear()
-        return
-    raw = message.text.strip()
-    left, sep, right = raw.partition("-")
-    if not sep:
-        await message.answer("Не понял. Пример: 01.09-25.12")
+        await message.answer("Пара не найдена — возможно, её удалили.")
         return
     try:
-        t = today(user)
-        vfrom = parse_date(left, t) if left.strip() else None
-        vto = parse_date(right, t) if right.strip() else None
+        vfrom, vto = _parse_period(message.text, today(user))
     except ParseError as e:
         await message.answer(str(e))
         return
-    if vfrom and vto and vto < vfrom:
-        await message.answer("Конец раньше начала. Пример: 01.09-25.12")
-        return
     lesson.valid_from, lesson.valid_to = vfrom, vto
     await state.clear()
-    await message.answer("Сроки сохранены.")
+    if vfrom or vto:
+        period = "Сроки сохранены: пара идёт"
+        if vfrom:
+            period += f" с {fmt_date(vfrom, year=True)}"
+        if vto:
+            period += f" по {fmt_date(vto, year=True)}"
+        await message.answer(period + ".")
+    else:
+        await message.answer("Сроки сняты: пара идёт без ограничений.")
     await _show_editor(message, session, user)
 
 
@@ -310,7 +352,7 @@ async def _ask_subject(event, state: FSMContext, session: AsyncSession, user: Us
     b.button(text="➕ Новый предмет", callback_data=kb.Pick(kind="subj", value="new"))
     kb.cancel_row(b)
     b.adjust(1)
-    await show(event, "Какой предмет?", b.as_markup())
+    await show(event, "Какой предмет? Выберите кнопкой или напишите название.", b.as_markup())
 
 
 @router.callback_query(kb.Nav.filter(F.to == "add_lesson"), StateFilter("*"))
@@ -336,13 +378,14 @@ async def add_lesson_subject(cb: CallbackQuery, callback_data: kb.Pick, state: F
         return
     s = await subj.get_subject(session, user.id, int(callback_data.value))
     if s is None:
-        await cb.answer("Предмет не найден", show_alert=True)
+        await answer_cb(cb, "Предмет не найден — возможно, его удалили.", show_alert=True)
         return
     await state.update_data(subject_id=s.id)
     await _after_subject(cb, state, session, user)
 
 
 @router.message(AddLesson.new_subject, F.text, NOT_MENU)
+@router.message(AddLesson.subject, F.text, NOT_MENU)  # название можно и написать, а не выбрать кнопкой
 async def add_lesson_new_subject(message: Message, state: FSMContext, session: AsyncSession, user: User) -> None:
     try:
         s = await subj.find_or_create(session, user.id, message.text)
@@ -373,6 +416,16 @@ async def add_lesson_weekday(cb: CallbackQuery, callback_data: kb.Pick, state: F
     await _ask_time(cb, state, session, user)
 
 
+@router.message(AddLesson.weekday, F.text, NOT_MENU)
+async def add_lesson_weekday_text(message: Message, state: FSMContext, session: AsyncSession, user: User) -> None:
+    wd = parse_weekday(message.text)
+    if wd is None:
+        await message.answer("Не понял день недели. Нажмите кнопку или напишите, например: «вторник» или «Вт».")
+        return
+    await state.update_data(weekday=wd)
+    await _ask_time(message, state, session, user)
+
+
 async def _ask_time(event, state: FSMContext, session: AsyncSession, user: User) -> None:
     await state.set_state(AddLesson.time)
     s = await _load(session, user)
@@ -383,7 +436,8 @@ async def _ask_time(event, state: FSMContext, session: AsyncSession, user: User)
             callback_data=kb.Pick(kind="slot", value=f"{start.strftime('%H%M')}{end.strftime('%H%M')}"),
         )
     b.adjust(3)
-    kb.cancel_row(b)
+    # «Отмена» — всегда отдельной строкой, чтобы её не приняли за ещё одно время.
+    b.row(InlineKeyboardButton(text="✖️ Отмена", callback_data=kb.Nav(to="cancel").pack()))
     hint = "Выберите время из уже введённых или напишите новое." if s.time_slots() else "Напишите время пары."
     await show(event, f"{hint}\nНапример: <code>9:00-10:30</code>", b.as_markup())
 
@@ -412,7 +466,8 @@ async def _after_time(event, state: FSMContext, user: User, start, end) -> None:
         await _ask_details(event, state)
         return
     await state.set_state(AddLesson.parity)
-    cur = "нечётная" if parity_of(today(user), week1(user)) == 1 else "чётная"
+    p = parity_of(today(user), week1(user))
+    cur, other = ("нечётная", "чётная") if p == 1 else ("чётная", "нечётная")
     b = InlineKeyboardBuilder()
     b.button(text="Каждую неделю", callback_data=kb.Pick(kind="par", value="0"))
     b.button(text="Нечётные недели", callback_data=kb.Pick(kind="par", value="1"))
@@ -421,8 +476,8 @@ async def _after_time(event, state: FSMContext, user: User, start, end) -> None:
     b.adjust(1)
     await show(
         event,
-        f"Как часто бывает эта пара?\n<i>Сейчас {cur} неделя. Если считаете иначе, чем в вашем вузе, — "
-        "поправьте первую неделю семестра в ⚙️ Настройках.</i>",
+        f"Как часто бывает эта пара?\n<i>По моему счёту сейчас {cur} неделя. Если в вашем вузе сейчас "
+        f"{other} — поправьте первую неделю семестра: ⚙️ Настройки → 🔢 Первая неделя.</i>",
         b.as_markup(),
     )
 
@@ -462,20 +517,24 @@ async def _save_lesson(event, state: FSMContext, session: AsyncSession, user: Us
     data = await state.get_data()
     parts = parts + [None] * (3 - len(parts))
     on_date = date.fromisoformat(data["on_date"]) if data.get("on_date") else None
-    await sch.add_lesson(
-        session,
-        user.id,
-        data["subject_id"],
-        time.fromisoformat(data["start"]),
-        time.fromisoformat(data["end"]),
-        weekday=None if on_date else data["weekday"],
-        parity=data.get("parity", 0),
-        on_date=on_date,
-        room=parts[0],
-        teacher=parts[1],
-        kind=parts[2],
-    )
     await state.clear()
+    try:
+        await sch.add_lesson(
+            session,
+            user.id,
+            data["subject_id"],
+            time.fromisoformat(data["start"]),
+            time.fromisoformat(data["end"]),
+            weekday=None if on_date else data["weekday"],
+            parity=data.get("parity", 0),
+            on_date=on_date,
+            room=parts[0],
+            teacher=parts[1],
+            kind=parts[2],
+        )
+    except sch.ScheduleError as e:  # например, предмет удалили, пока шёл диалог
+        await show(event, str(e))
+        return
     b = InlineKeyboardBuilder()
     if on_date:
         b.button(text="⬅️ К этому дню", callback_data=kb.DayCb(action="show", day=on_date.isoformat()))
@@ -511,8 +570,9 @@ async def subjects_cb(cb: CallbackQuery, state: FSMContext, session: AsyncSessio
     await _show_subjects(cb, session, user)
 
 
-@router.callback_query(kb.Nav.filter(F.to == "subj_new"))
+@router.callback_query(kb.Nav.filter(F.to == "subj_new"), StateFilter("*"))
 async def subject_new(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
     await state.set_state(SubjectEdit.new)
     b = InlineKeyboardBuilder()
     kb.cancel_row(b)
@@ -534,7 +594,7 @@ async def subject_new_text(message: Message, state: FSMContext, session: AsyncSe
 async def subject_open(cb: CallbackQuery, callback_data: kb.SubjCb, session: AsyncSession, user: User) -> None:
     s = await subj.get_subject(session, user.id, callback_data.id)
     if s is None:
-        await cb.answer("Предмет не найден", show_alert=True)
+        await answer_cb(cb, "Предмет не найден — возможно, его удалили.", show_alert=True)
         return
     b = InlineKeyboardBuilder()
     b.button(text="✏️ Переименовать", callback_data=kb.SubjCb(action="rename", id=s.id))
@@ -544,10 +604,15 @@ async def subject_open(cb: CallbackQuery, callback_data: kb.SubjCb, session: Asy
     await show(cb, f"<b>{escape(s.name)}</b>", b.as_markup())
 
 
-@router.callback_query(kb.SubjCb.filter(F.action == "rename"))
-async def subject_rename(cb: CallbackQuery, callback_data: kb.SubjCb, state: FSMContext) -> None:
+@router.callback_query(kb.SubjCb.filter(F.action == "rename"), StateFilter("*"))
+async def subject_rename(cb: CallbackQuery, callback_data: kb.SubjCb, state: FSMContext, session: AsyncSession, user: User) -> None:
+    s = await subj.get_subject(session, user.id, callback_data.id)
+    if s is None:
+        await answer_cb(cb, "Предмет не найден — возможно, его удалили.", show_alert=True)
+        return
+    await state.clear()  # не смешиваем с данными другого начатого диалога
     await state.set_state(SubjectEdit.rename)
-    await state.update_data(subject_id=callback_data.id)
+    await state.update_data(subject_id=s.id)
     b = InlineKeyboardBuilder()
     kb.cancel_row(b)
     await show(cb, "Напишите новое название.", b.as_markup())
@@ -557,12 +622,15 @@ async def subject_rename(cb: CallbackQuery, callback_data: kb.SubjCb, state: FSM
 async def subject_rename_text(message: Message, state: FSMContext, session: AsyncSession, user: User) -> None:
     data = await state.get_data()
     s = await subj.get_subject(session, user.id, data["subject_id"])
-    if s is not None:
-        try:
-            await subj.rename(session, s, message.text)
-        except subj.SubjectError as e:
-            await message.answer(str(e))
-            return
+    if s is None:
+        await state.clear()
+        await message.answer("Предмет не найден — возможно, его удалили.")
+        return
+    try:
+        await subj.rename(session, s, message.text)
+    except subj.SubjectError as e:
+        await message.answer(str(e))
+        return
     await state.clear()
     await _show_subjects(message, session, user)
 
@@ -571,7 +639,7 @@ async def subject_rename_text(message: Message, state: FSMContext, session: Asyn
 async def subject_del(cb: CallbackQuery, callback_data: kb.SubjCb, session: AsyncSession, user: User) -> None:
     s = await subj.get_subject(session, user.id, callback_data.id)
     if s is None:
-        await cb.answer("Предмет не найден", show_alert=True)
+        await answer_cb(cb, "Предмет не найден — возможно, его удалили.", show_alert=True)
         return
     n_lessons, n_hw = await subj.usage(session, s)
     b = InlineKeyboardBuilder()

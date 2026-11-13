@@ -7,4 +7,5 @@ COPY bot ./bot
 COPY migrations ./migrations
 COPY alembic.ini .
 # Сначала обновляем структуру базы, затем запускаем бота.
-CMD ["sh", "-c", "alembic upgrade head && python -m bot"]
+# exec: бот становится главным процессом контейнера и корректно завершается по «Остановить бота».
+CMD ["sh", "-c", "alembic upgrade head && exec python -m bot"]

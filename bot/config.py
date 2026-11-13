@@ -1,6 +1,8 @@
 """Настройки бота. Читаются из переменных окружения и файла .env."""
 
-from pydantic import SecretStr
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,6 +20,30 @@ class Settings(BaseSettings):
     telegram_proxy: str | None = None
     default_timezone: str = "Europe/Moscow"
     log_level: str = "INFO"
+
+    @field_validator("bot_token", mode="before")
+    @classmethod
+    def _strip_token(cls, v):
+        # Лишние пробелы или кавычки при вставке токена в TextEdit.
+        return v.strip().strip("\"'").strip() if isinstance(v, str) else v
+
+    @field_validator("telegram_api_url")
+    @classmethod
+    def _check_api_url(cls, v: str) -> str:
+        v = v.strip()
+        if not v.startswith(("http://", "https://")):
+            raise ValueError("TELEGRAM_API_URL должен начинаться с https:// (например, https://api.telegram.org)")
+        return v.rstrip("/")
+
+    @field_validator("default_timezone")
+    @classmethod
+    def _check_tz(cls, v: str) -> str:
+        v = v.strip()
+        try:
+            ZoneInfo(v)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise ValueError("такого часового пояса нет. Пример: Europe/Moscow, Asia/Yekaterinburg") from None
+        return v
 
 
 def load_settings() -> Settings:

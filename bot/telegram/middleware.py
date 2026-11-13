@@ -3,10 +3,12 @@
 from typing import Any, Awaitable, Callable
 
 from aiogram import BaseMiddleware
+from aiogram.exceptions import TelegramAPIError
 from aiogram.types import TelegramObject
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from bot.core.users import get_or_create_user
+from bot.messenger import MessageRejected, TemporaryFailure
 
 
 class DbMiddleware(BaseMiddleware):
@@ -30,8 +32,13 @@ class DbMiddleware(BaseMiddleware):
             data["user"] = await get_or_create_user(session, "telegram", str(tg_user.id), self.default_tz)
             try:
                 result = await handler(event, data)
+            except (TelegramAPIError, TemporaryFailure, MessageRejected):
+                # Не удалось только ответить в Telegram. Изменения обработчики делают до ответа,
+                # и студент их уже запросил — сохраняем, а не откатываем.
                 await session.commit()
-                return result
+                raise
             except Exception:
                 await session.rollback()
                 raise
+            await session.commit()
+            return result

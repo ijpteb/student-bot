@@ -3,7 +3,7 @@
 import re
 from datetime import date
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.core import reminders
@@ -99,6 +99,16 @@ async def delete_user_data(session: AsyncSession, user: User) -> None:
     await session.execute(delete(LessonCancel).where(LessonCancel.lesson_id.in_(lesson_ids)))
     await session.execute(delete(Lesson).where(Lesson.user_id == uid))
     await session.execute(delete(Subject).where(Subject.user_id == uid))
+    # Счётчик заявок на вузы сохраняем, но только для названий, которые писали и другие студенты:
+    # уникальный текст мог быть чем угодно (вплоть до личных данных) — его удаляем.
+    others = select(UniversityRequest.name_key).where(
+        or_(UniversityRequest.user_id != uid, UniversityRequest.user_id.is_(None))
+    )
+    await session.execute(
+        delete(UniversityRequest).where(
+            UniversityRequest.user_id == uid, UniversityRequest.name_key.not_in(others)
+        )
+    )
     await session.execute(
         update(UniversityRequest).where(UniversityRequest.user_id == uid).values(user_id=None)
     )

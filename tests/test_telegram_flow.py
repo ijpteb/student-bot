@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from aiogram import Bot
 from aiogram.client.session.base import BaseSession
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.methods import AnswerCallbackQuery, EditMessageText, GetMe, SendMessage, TelegramMethod
 from aiogram.types import Chat, Message, Update, User as TgUser
 from sqlalchemy import select
@@ -21,15 +22,28 @@ TOKEN = "123456:" + "A" * 35
 
 
 class FakeSession(BaseSession):
-    """Вместо отправки в Telegram запоминает, что бот хотел сделать."""
+    """Вместо отправки в Telegram запоминает, что бот хотел сделать.
+    Как и настоящий Telegram, отклоняет второй ответ на одно и то же нажатие кнопки.
+    fail(method) -> исключение позволяет имитировать сбои Telegram."""
 
     def __init__(self):
         super().__init__()
         self.calls: list[TelegramMethod] = []
         self._mid = 1000
+        self.answered: set[str] = set()
+        self.fail = None
 
     async def make_request(self, bot, method, timeout=None):
         self.calls.append(method)
+        if self.fail is not None and (exc := self.fail(method)) is not None:
+            raise exc
+        if isinstance(method, AnswerCallbackQuery):
+            if method.callback_query_id in self.answered:
+                raise TelegramBadRequest(
+                    method=method,
+                    message="Bad Request: query is too old and response timeout expired or query ID is invalid",
+                )
+            self.answered.add(method.callback_query_id)
         if isinstance(method, GetMe):
             return TgUser(id=1, is_bot=True, first_name="Bot", username="test_bot")
         if isinstance(method, (SendMessage, EditMessageText)):
@@ -72,41 +86,63 @@ class Harness:
         self.notifier = TelegramNotifier(self.bot, settings.admin_id)
         self.dp = create_dispatcher(sessionmaker, settings, self.notifier)
         self.uid = 0
+        self.pressed: list[str] = []
 
     def _next(self) -> int:
         self.uid += 1
         return self.uid
 
-    async def text(self, chat_id: int, text: str) -> None:
-        upd = {
-            "update_id": self._next(),
-            "message": {
-                "message_id": self._next(),
-                "date": int(datetime.now().timestamp()),
-                "chat": {"id": chat_id, "type": "private"},
-                "from": {"id": chat_id, "is_bot": False, "first_name": "Студент"},
-                "text": text,
-            },
+    def _message(self, chat_id: int, date: float | None = None, **fields) -> dict:
+        return {
+            "message_id": self._next(),
+            "date": int(date if date is not None else datetime.now().timestamp()),
+            "chat": {"id": chat_id, "type": "private"},
+            "from": {"id": chat_id, "is_bot": False, "first_name": "Студент"},
+            **fields,
         }
+
+    async def feed(self, upd: dict) -> None:
         await self.dp.feed_update(self.bot, Update.model_validate(upd, context={"bot": self.bot}))
 
-    async def press(self, chat_id: int, data: str) -> None:
-        upd = {
-            "update_id": self._next(),
-            "callback_query": {
-                "id": str(self._next()),
-                "chat_instance": "x",
-                "from": {"id": chat_id, "is_bot": False, "first_name": "Студент"},
-                "data": data,
-                "message": {
-                    "message_id": 5,
-                    "date": int(datetime.now().timestamp()),
-                    "chat": {"id": chat_id, "type": "private"},
-                    "text": "…",
-                },
-            },
+    def text_update(self, chat_id: int, text: str, date: float | None = None, **fields) -> dict:
+        return {"update_id": self._next(), "message": self._message(chat_id, date, text=text, **fields)}
+
+    def photo_update(self, chat_id: int, caption: str | None = None, media_group: str | None = None) -> dict:
+        n = self._next()
+        msg = self._message(chat_id, photo=[{"file_id": f"photo{n}", "file_unique_id": f"u{n}", "width": 10, "height": 10}])
+        if caption is not None:
+            msg["caption"] = caption
+        if media_group is not None:
+            msg["media_group_id"] = media_group
+        return {"update_id": self._next(), "message": msg}
+
+    def press_update(self, chat_id: int, data: str, inaccessible: bool = False) -> dict:
+        message = {
+            "message_id": 5,
+            "date": 0 if inaccessible else int(datetime.now().timestamp()),
+            "chat": {"id": chat_id, "type": "private"},
         }
-        await self.dp.feed_update(self.bot, Update.model_validate(upd, context={"bot": self.bot}))
+        if not inaccessible:
+            message["text"] = "…"
+        cq = {
+            "id": str(self._next()),
+            "chat_instance": "x",
+            "from": {"id": chat_id, "is_bot": False, "first_name": "Студент"},
+            "data": data,
+            "message": message,
+        }
+        self.pressed.append(cq["id"])
+        return {"update_id": self._next(), "callback_query": cq}
+
+    async def text(self, chat_id: int, text: str, date: float | None = None, **fields) -> None:
+        await self.feed(self.text_update(chat_id, text, date, **fields))
+
+    async def press(self, chat_id: int, data: str, inaccessible: bool = False) -> None:
+        await self.feed(self.press_update(chat_id, data, inaccessible))
+
+    def unanswered(self) -> list[str]:
+        """Нажатия кнопок, на которые бот так и не ответил (у студента вечно крутится значок)."""
+        return [i for i in self.pressed if i not in self.fake.answered]
 
     async def press_label(self, chat_id: int, starts: str) -> None:
         for text, data in self.fake.last_markup_buttons():
