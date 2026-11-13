@@ -189,8 +189,8 @@ async def week1_default(cb: CallbackQuery, state: FSMContext, user: User) -> Non
 @router.message(SettingsInput.week1, F.text, NOT_MENU)
 async def week1_text(message: Message, state: FSMContext, user: User) -> None:
     try:
-        # Начало семестра обычно уже в прошлом: «01.09» в ноябре — это 1 сентября этого года.
-        d = parse_date(message.text, today(user), mode="nearest")
+        # Дата из текущего учебного года: «01.09» в ноябре — этот сентябрь, «08.02» — следующий февраль.
+        d = parse_date(message.text, today(user), mode="academic")
     except ParseError as e:
         await message.answer(str(e))
         return

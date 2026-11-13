@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from bot.alerts import AdminAlerts
 from bot.config import Settings
 from bot.telegram import handlers_common, handlers_homework, handlers_schedule, handlers_settings
-from bot.telegram.middleware import DbMiddleware
+from bot.telegram.middleware import DbMiddleware, reply_failed
 from bot.telegram.notifier import TelegramNotifier
 
 log = logging.getLogger(__name__)
@@ -45,20 +45,43 @@ def create_bot(settings: Settings, session: AiohttpSession | None = None) -> Bot
     )
 
 
-async def on_error(event: ErrorEvent, alerts: AdminAlerts) -> bool:
-    """Любая ошибка в обработчике: студенту — короткое извинение, владельцу — сообщение,
-    в журнал — только вид ошибки и место в коде (текст ошибки может содержать то, что ввёл студент)."""
+def _where(exc: BaseException) -> str:
+    """Места в коде бота, где случилась ошибка (без текста ошибки: там может быть то, что ввёл студент)."""
+    frames = traceback.extract_tb(exc.__traceback__)
+    ours = [f for f in frames if "/bot/" in f.filename and "site-packages" not in f.filename]
+    picked = (ours[-3:] + frames[-1:]) if ours else frames[-3:]
+    return "".join(traceback.format_list(picked))
+
+
+async def on_error(event: ErrorEvent, alerts: AdminAlerts, bot: Bot) -> bool:
+    """Любая ошибка в обработчике: студенту — короткое сообщение, владельцу — уведомление,
+    в журнал — только вид ошибки и место в коде."""
     exc = event.exception
-    where = "".join(traceback.format_tb(exc.__traceback__)[-3:])
-    log.error("Ошибка при обработке обновления %s: %s\n%s", event.update.update_id, type(exc).__name__, where)
     upd = event.update
-    try:
-        if upd.callback_query:
-            await upd.callback_query.answer("Что-то пошло не так 😕 Попробуйте ещё раз.", show_alert=True)
-        elif upd.message:
-            await upd.message.answer("Что-то пошло не так 😕 Попробуйте ещё раз. Выйти из ввода — /cancel.")
-    except Exception:
-        pass  # ответить не удалось (например, нет связи) — ничего страшного
+    log.error("Ошибка при обработке обновления %s: %s\n%s", upd.update_id, type(exc).__name__, _where(exc))
+    if reply_failed(exc):
+        # Изменения сохранены (см. DbMiddleware) — не просим повторять, иначе получатся дубли.
+        text = (
+            "Не удалось показать ответ: была проблема со связью с Telegram. "
+            "То, что вы сделали, сохранено — проверьте, например, в «📚 Задания» или в расписании."
+        )
+    else:
+        text = "Что-то пошло не так 😕 Изменения не сохранены — попробуйте ещё раз. Выйти из ввода — /cancel."
+    chat_id = None
+    if upd.callback_query:
+        chat_id = upd.callback_query.from_user.id
+        try:
+            await upd.callback_query.answer(text, show_alert=True)
+            chat_id = None  # доставлено
+        except Exception:
+            pass  # на нажатие уже ответили (или нет связи) — попробуем обычным сообщением
+    elif upd.message:
+        chat_id = upd.message.chat.id
+    if chat_id is not None:
+        try:
+            await bot.send_message(chat_id, text)
+        except Exception:
+            pass  # ответить не удалось (например, нет связи) — ничего страшного
     await alerts.report(f"handler:{type(exc).__name__}", f"Ошибка в боте: {type(exc).__name__}. Подробности — в журнале.")
     return True
 

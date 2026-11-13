@@ -3,7 +3,7 @@
 import logging
 from datetime import date, datetime
 
-from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 
 from bot.core.render import visible_len
@@ -46,7 +46,7 @@ async def answer_cb(cb: CallbackQuery, text: str | None = None, show_alert: bool
     пока бот был выключен): сделанное уже сохранено, откатывать его нельзя."""
     try:
         await cb.answer(text, show_alert=show_alert)
-    except TelegramAPIError as e:
+    except Exception as e:  # устаревшее нажатие, нет связи, прокси — ответ не обязателен
         log.info("Ответ на нажатие кнопки не доставлен: %s", type(e).__name__)
 
 

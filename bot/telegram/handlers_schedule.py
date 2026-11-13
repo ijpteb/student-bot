@@ -284,14 +284,14 @@ async def lesson_period(cb: CallbackQuery, callback_data: kb.LessonCb, state: FS
 
 
 def _parse_period(raw: str, today_: date) -> tuple[date | None, date | None]:
-    """«01.09-25.12», «-25.12», «01.10-», «-». Год можно не писать: начало — ближайшая к сегодняшнему
-    дню такая дата (обычно уже прошедшая), конец — первая такая дата после начала."""
+    """«01.09-25.12», «-25.12», «01.10-», «-». Год можно не писать: даты берутся из текущего учебного
+    года (август — июль), а конец периода — первая такая дата после начала."""
     left, sep, right = raw.strip().partition("-")
     if not sep:
         raise ParseError("Не понял. Пример: 01.09-25.12")
-    vfrom = parse_date(left, today_, mode="nearest") if left.strip() else None
+    vfrom = parse_date(left, today_, mode="academic") if left.strip() else None
     if right.strip():
-        vto = parse_date(right, vfrom, mode="after") if vfrom else parse_date(right, today_, mode="nearest")
+        vto = parse_date(right, vfrom, mode="after") if vfrom else parse_date(right, today_, mode="academic")
     else:
         vto = None
     if vfrom and vto and vto < vfrom:

@@ -24,8 +24,8 @@ class Settings(BaseSettings):
     @field_validator("bot_token", mode="before")
     @classmethod
     def _strip_token(cls, v):
-        # Лишние пробелы или кавычки при вставке токена в TextEdit.
-        return v.strip().strip("\"'").strip() if isinstance(v, str) else v
+        # Лишние пробелы или кавычки при вставке токена в TextEdit (там кавычки бывают «ёлочками» и “лапками”).
+        return v.strip().strip("\"'“”„«»‘’").strip() if isinstance(v, str) else v
 
     @field_validator("telegram_api_url")
     @classmethod

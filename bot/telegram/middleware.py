@@ -9,6 +9,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from bot.core.users import get_or_create_user
 from bot.messenger import MessageRejected, TemporaryFailure
+from bot.telegram.errors import is_transport_error
+
+
+def reply_failed(exc: BaseException) -> bool:
+    """Ошибка случилась при ответе в Telegram (а не в логике бота): изменения к этому моменту сделаны."""
+    return isinstance(exc, (TelegramAPIError, TemporaryFailure, MessageRejected)) or is_transport_error(exc)
 
 
 class DbMiddleware(BaseMiddleware):
@@ -32,13 +38,13 @@ class DbMiddleware(BaseMiddleware):
             data["user"] = await get_or_create_user(session, "telegram", str(tg_user.id), self.default_tz)
             try:
                 result = await handler(event, data)
-            except (TelegramAPIError, TemporaryFailure, MessageRejected):
-                # Не удалось только ответить в Telegram. Изменения обработчики делают до ответа,
-                # и студент их уже запросил — сохраняем, а не откатываем.
-                await session.commit()
-                raise
-            except Exception:
-                await session.rollback()
+            except Exception as e:
+                if reply_failed(e):
+                    # Не удалось только ответить в Telegram. Изменения обработчики делают до ответа,
+                    # и студент их уже запросил — сохраняем, а не откатываем.
+                    await session.commit()
+                else:
+                    await session.rollback()
                 raise
             await session.commit()
             return result

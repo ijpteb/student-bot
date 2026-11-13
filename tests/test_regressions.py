@@ -435,7 +435,7 @@ async def test_F17_delete_me_clears_dialog(h):
     await h.press(A, kb.Pick(kind="due", value="none").pack())  # старая кнопка срока
     async with h.sessionmaker() as s:
         assert await s.scalar(select(Homework)) is None
-    assert "Эта кнопка уже не действует. Начните заново из меню." in h.fake.alerts()
+    assert "Эта кнопка уже не действует (действие выполнено или устарело)." in h.fake.alerts()
 
 
 async def test_F19_one_off_lesson_with_empty_schedule(h):
@@ -566,3 +566,197 @@ async def test_F49_handler_error_reported(h, monkeypatch):
     sent = [c for c in h.fake.calls if isinstance(c, SendMessage)]
     assert any("Что-то пошло не так" in c.text and c.chat_id == A for c in sent)
     assert any("Ошибка в боте: RuntimeError" in c.text and c.chat_id == 777 for c in sent)
+
+
+# ================= Второй круг проверки (находки R…) =================
+
+from aiogram.exceptions import ClientDecodeError, TelegramRetryAfter  # noqa: E402
+from aiogram.methods import SendPhoto  # noqa: E402
+from python_socks import ProxyConnectionError  # noqa: E402
+
+from bot.telegram.app import _where  # noqa: E402
+from bot.telegram.errors import is_transport_error  # noqa: E402
+
+
+def test_R_transport_errors_classified():
+    import aiohttp_socks
+
+    assert is_transport_error(ProxyConnectionError("proxy down"))
+    assert is_transport_error(aiohttp_socks.ProxyConnectionError("proxy down"))  # так падает настоящий прокси
+    assert is_transport_error(aiohttp_socks.ProxyError("host unreachable"))
+    assert is_transport_error(ClientDecodeError("bad json", ValueError(), "<html>502</html>"))
+    assert is_transport_error(TimeoutError())
+    assert not is_transport_error(RuntimeError("bug"))
+
+
+async def test_R_reminder_waits_while_proxy_down(sessionmaker):
+    async with sessionmaker() as session:
+        user, hw = await _user_hw(session)
+        await reminders.set_reminder(session, user, hw, datetime(2026, 11, 15, 20, 0))
+        await session.commit()
+    from tests.test_telegram_flow import FakeSession
+    from aiogram import Bot
+    from bot.telegram.notifier import TelegramNotifier
+
+    fake = FakeSession()
+    fake.fail = lambda m: ProxyConnectionError("proxy down") if isinstance(m, SendMessage) else None
+    notifier = TelegramNotifier(Bot(TOKEN, session=fake), admin_id=None)
+    for minute in range(12):  # 6 минут без прокси
+        await scheduler.tick(sessionmaker, notifier, AdminAlerts(notifier), utc(2026, 11, 15, 17, minute))
+    fake.fail = None
+    await scheduler.tick(sessionmaker, notifier, AdminAlerts(notifier), utc(2026, 11, 15, 18, 0))
+    assert any(isinstance(c, SendMessage) and "Напоминание" in c.text for c in fake.calls)
+
+
+async def test_R_reply_failure_keeps_change_and_says_saved(h):
+    await _make_hw(h)
+    async with h.sessionmaker() as s:
+        hw = await s.scalar(select(Homework))
+    h.fake.fail = lambda m: ClientDecodeError("bad json", ValueError(), "<html>502</html>") if isinstance(m, EditMessageText) else None
+    await h.press(A, kb.HwCb(action="done", id=hw.id).pack())
+    async with h.sessionmaker() as s:
+        assert (await s.get(Homework, hw.id)).done
+    assert any("сохранено" in a for a in h.fake.alerts())
+    assert not any("попробуйте ещё раз" in a for a in h.fake.alerts())
+
+
+async def test_R_error_message_after_answered_press(h):
+    async with h.sessionmaker() as s:
+        u = await get_or_create_user(s, "telegram", str(A))
+        sid = (await subj.find_or_create(s, u.id, "История")).id
+        hw = await hw_core.add(s, u.id, sid, "x", attachments=[("photo", "bad-file-id")])
+        await s.commit()
+    h.fake.fail = lambda m: TelegramBadRequest(method=m, message="wrong file identifier") if isinstance(m, SendPhoto) else None
+    await h.press(A, kb.HwCb(action="files", id=hw.id).pack())
+    sent = [c for c in h.fake.calls if isinstance(c, SendMessage) and c.chat_id == A]
+    assert sent and "Не удалось показать ответ" in sent[-1].text  # нажатие уже отвечено — пишем сообщением
+
+
+async def test_R_flood_wait_on_attachments_does_not_block(h):
+    import time as _t
+
+    async with h.sessionmaker() as s:
+        u = await get_or_create_user(s, "telegram", str(A))
+        sid = (await subj.find_or_create(s, u.id, "История")).id
+        hw = await hw_core.add(s, u.id, sid, "x", attachments=[("photo", "f1")])
+        await s.commit()
+    h.fake.fail = lambda m: TelegramRetryAfter(method=m, message="flood", retry_after=30) if isinstance(m, SendPhoto) else None
+    t0 = _t.monotonic()
+    await h.press(A, kb.HwCb(action="files", id=hw.id).pack())
+    assert _t.monotonic() - t0 < 5
+
+
+async def test_R_rollback_error_text(h, monkeypatch):
+    from bot.telegram import handlers_schedule
+
+    async def broken(*a, **kw):
+        raise RuntimeError("сбой")
+
+    monkeypatch.setattr(handlers_schedule, "_load", broken)
+    await h.text(A, kb.TODAY)
+    assert any("Изменения не сохранены" in t for t in h.fake.texts())
+
+
+def test_R_error_log_points_to_bot_code():
+    from bot.core.timeutil import parse_time
+
+    try:
+        parse_time("ерунда")
+    except ParseError as e:
+        assert "bot/core/timeutil.py" in _where(e)
+
+
+async def test_R_admin_alerts_burst_sends_one():
+    class Slow(FakeNotifier):
+        async def notify_admin(self, text):
+            await asyncio.sleep(0.05)
+            self.admin.append(text)
+
+    n = Slow()
+    alerts = AdminAlerts(n)
+    await asyncio.gather(*(alerts.report("handler:X", "ошибка") for _ in range(5)))
+    assert len(n.admin) == 1
+
+
+@pytest.mark.parametrize(
+    "text,today_,expected",
+    [
+        ("-30.06", date(2026, 9, 7), (None, date(2027, 6, 30))),
+        ("-31.05", date(2026, 10, 1), (None, date(2027, 5, 31))),
+        ("01.04-30.06", date(2026, 9, 7), (date(2027, 4, 1), date(2027, 6, 30))),
+        ("-30.10", TODAY, (None, date(2026, 10, 30))),
+        ("01.09-25.12", date(2026, 8, 25), (date(2026, 9, 1), date(2026, 12, 25))),
+    ],
+)
+def test_R_period_end_in_academic_year(text, today_, expected):
+    assert _parse_period(text, today_) == expected
+
+
+def test_R_week1_academic():
+    assert parse_date("08.02", date(2026, 12, 10), mode="academic") == date(2027, 2, 8)
+    assert parse_date("01.09", TODAY, mode="academic") == date(2026, 9, 1)
+
+
+def test_R_reminder_phrasing():
+    now = datetime(2026, 11, 12, 18, 0)
+    with pytest.raises(ParseError, match="25.12 18:00"):
+        parse_moment("25.12", now)  # только дата: просим добавить время, без «25:12»
+    assert parse_moment("9.30 завтра", now) == datetime(2026, 11, 13, 9, 30)
+    assert parse_moment("к 9 завтра", now) == datetime(2026, 11, 13, 9, 0)
+    assert parse_date_time("18.00 15.11", TODAY) == (date(2026, 11, 15), time(18, 0))
+    assert parse_date_time("15.11 18.00", TODAY) == (date(2026, 11, 15), time(18, 0))
+
+
+def test_R_year_shown_only_for_far_dates():
+    from bot.core.timeutil import fmt_date, now_utc
+
+    today_utc = now_utc().date()
+    assert str(today_utc.year) not in fmt_date(today_utc + timedelta(days=20))
+    far = today_utc + timedelta(days=300)
+    assert str(far.year) in fmt_date(far)
+
+
+def test_R_token_curly_quotes():
+    s = Settings(bot_token=f"“{TOKEN}”", _env_file=None)
+    assert s.bot_token.get_secret_value() == TOKEN
+
+
+def test_R_malformed_token_friendly(monkeypatch, capsys):
+    from bot import __main__ as entry
+
+    monkeypatch.setenv("BOT_TOKEN", "это не токен")
+    monkeypatch.delenv("ADMIN_ID", raising=False)
+    monkeypatch.chdir("/")
+    with pytest.raises(SystemExit):
+        entry.run()
+    assert "записан неверно" in capsys.readouterr().err
+    logging.getLogger().handlers.clear()
+
+
+async def test_R_cancel_word_at_subject_step(h):
+    await _make_hw(h, subject="История")
+    await h.text(A, kb.ADD_HW)
+    await h.text(A, "Отмена")
+    assert h.fake.texts()[-1] == "Отменено."
+    async with h.sessionmaker() as s:
+        assert [x.name for x in await subj.list_subjects(s, (await s.scalar(select(User))).id)] == ["История"]
+
+
+async def test_R_service_message_ignored(h):
+    h.fake.calls.clear()
+    await h.feed(h.text_update(A, "x") | {"message": h._message(A, pinned_message={"message_id": 5, "date": 0, "chat": {"id": A, "type": "private"}})})
+    assert not [c for c in h.fake.calls if isinstance(c, SendMessage)]
+
+
+async def test_R_album_outside_dialog_one_reply(h):
+    h.fake.calls.clear()
+    for u in [h.photo_update(A, "Задачи", "g9"), h.photo_update(A, None, "g9"), h.photo_update(A, None, "g9")]:
+        await h.feed(u)
+    assert len([c for c in h.fake.calls if isinstance(c, SendMessage)]) == 1
+
+
+async def test_R_photo_at_subject_step_explained(h):
+    await _make_hw(h, subject="История")
+    await h.text(A, kb.ADD_HW)
+    await h.feed(h.photo_update(A))
+    assert "не сохранено" in h.fake.texts()[-1]

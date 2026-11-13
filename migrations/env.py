@@ -80,7 +80,14 @@ async def run_async_migrations() -> None:
         try:
             connection = await connectable.connect()
             break
-        except (OSError, DBAPIError):
+        except (OSError, DBAPIError) as e:
+            if "password authentication failed" in str(e):
+                print(
+                    "Неверный пароль базы данных. Запустите «Запустить бота.command» ещё раз — "
+                    "он сверяет пароль базы с файлом .env.",
+                    flush=True,
+                )
+                raise
             if attempt == 29:
                 raise
             if attempt == 0:

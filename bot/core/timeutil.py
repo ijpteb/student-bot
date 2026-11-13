@@ -84,10 +84,10 @@ PARITY_NAMES = {0: "каждую неделю", 1: "по нечётным нед
 
 
 def fmt_date(d: date, with_weekday: bool = False, year: bool | None = None) -> str:
-    """«15 ноября». Год показываем, если он не текущий (или если year=True),
-    чтобы ошибка в годе была видна сразу."""
+    """«15 ноября». Год показываем, если дата дальше полугода от сегодняшней (или если year=True),
+    чтобы ошибка в годе была видна сразу, а близкие даты (и даты на стыке лет) читались коротко."""
     s = f"{d.day} {MONTHS_GEN[d.month - 1]}"
-    if year or (year is None and d.year != now_utc().year):
+    if year or (year is None and abs((d - now_utc().date()).days) > 183):
         s += f" {d.year}"
     if with_weekday:
         s = f"{WEEKDAYS_SHORT[d.weekday()]}, {s}"
@@ -148,8 +148,10 @@ def parse_date(text: str, today: date, mode: str = "future") -> date:
 
     Если год не указан, он выбирается по смыслу (mode):
     - "future" — срок сдачи, напоминание: этот год, а если дата прошла больше 90 дней назад — следующий;
-    - "nearest" — начало семестра или периода: ближайшая к сегодняшнему дню такая дата (прошлый, этот или следующий год);
-    - "after" — конец периода: первая такая дата не раньше today (сюда передают начало периода).
+    - "academic" — начало семестра, сроки пары: дата внутри текущего учебного года
+      (с 1 августа по 31 июля: «01.09» в ноябре — этот сентябрь, «30.06» в сентябре — следующий июнь);
+    - "nearest" — ближайшая к сегодняшнему дню такая дата (прошлый, этот или следующий год);
+    - "after" — первая такая дата не раньше today (сюда передают, например, начало периода).
     """
     t = text.strip().lower()
     if t in _DAY_WORDS:
@@ -175,6 +177,13 @@ def parse_date(text: str, today: date, mode: str = "future") -> date:
             candidates.append(date(y, month, day))
         except ValueError:  # 29.02 в невисокосный год
             pass
+    if mode == "academic":
+        start_year = today.year if today.month >= 8 else today.year - 1
+        year = start_year if month >= 8 else start_year + 1
+        for c in candidates:
+            if c.year == year:
+                return c
+        return min(c for c in candidates if c.year >= year)  # 29.02 в невисокосный год — ближайший високосный
     if mode == "nearest":
         return min(candidates, key=lambda c: abs((c - today).days))
     if mode == "after":
@@ -195,14 +204,38 @@ def parse_weekday(text: str) -> int | None:
 _FILLER = {"в", "во", "к", "ко", "до", "на"}
 
 
+def _is_time(word: str) -> bool:
+    try:
+        parse_time(word)
+        return True
+    except ParseError:
+        return False
+
+
 def _words(text: str) -> list[str]:
     """Делит ввод на слова, отбрасывая «в», «к», «до», запятые и точку в конце.
-    Время перед датой («9:00 завтра») меняет местами с датой."""
+    Время перед датой («9:00 завтра», «9.30 завтра», «18.00 15.11») меняет местами с датой."""
     words = [w.rstrip(".") if not _TIME_RE.match(w) else w for w in text.replace(",", " ").split()]
     words = [w for w in words if w and w.lower() not in _FILLER]
-    if len(words) == 2 and ":" in words[0] and ":" not in words[1]:
-        words.reverse()
+    if len(words) == 2:
+        first, second = words
+        first_is_date = first.lower() in _DAY_WORDS or bool(_DATE_RE.match(first.lower()) and _valid_dm(first))
+        second_is_date = second.lower() in _DAY_WORDS or bool(_DATE_RE.match(second.lower()) and _valid_dm(second))
+        if _is_time(first) and not first_is_date and second_is_date:
+            words.reverse()
     return words
+
+
+def _valid_dm(word: str) -> bool:
+    """Похоже ли слово на существующую дату «день.месяц» (без учёта года)."""
+    m = _DATE_RE.match(word.lower())
+    if not m:
+        return False
+    try:
+        date(2024, int(m.group(2)), int(m.group(1)))
+        return True
+    except ValueError:
+        return False
 
 
 def parse_date_time(text: str, today: date) -> tuple[date, time | None]:
@@ -233,10 +266,11 @@ def parse_moment(text: str, now_local: datetime) -> datetime:
             raise ParseError("Укажите и время, например: завтра 9:00.")
         is_time = not re.search(r"[./]", word)
         if not is_time and re.fullmatch(r"\d{1,2}\.\d{2}", word):
-            # «19.30» датой быть не может — значит, время. «14.05» может быть и тем и другим.
+            # «19.30» датой быть не может — значит, время. «14.05» может быть и тем и другим,
+            # а «25.12» — только датой (25:12 не бывает): тогда просим добавить время.
             if not _is_date(word, now_local.date()):
                 is_time = True
-            else:
+            elif _is_time(word):
                 raise ParseError(
                     f"«{word}» — это дата или время? Время напишите через двоеточие (например, "
                     f"{word.replace('.', ':')}), а дату — вместе со временем (например, {word} 18:00)."
@@ -249,5 +283,5 @@ def parse_moment(text: str, now_local: datetime) -> datetime:
             return moment
     d, t = parse_date_time(" ".join(parts), now_local.date())
     if t is None:
-        raise ParseError("Укажите и время, например: 15.11 18:30.")
+        raise ParseError(f"Укажите и время, например: {' '.join(parts)} 18:00.")
     return datetime.combine(d, t)

@@ -5,7 +5,8 @@ import logging
 import os
 import sys
 
-from aiogram.exceptions import TelegramNetworkError, TelegramUnauthorizedError
+from aiogram.exceptions import TelegramUnauthorizedError
+from aiogram.utils.token import TokenValidationError
 from pydantic import ValidationError
 
 from bot import scheduler
@@ -14,6 +15,7 @@ from bot.config import load_settings
 from bot.db import make_engine, make_sessionmaker
 from bot.logging_setup import setup_logging
 from bot.telegram.app import create_bot, create_dispatcher, set_commands
+from bot.telegram.errors import is_transport_error
 from bot.telegram.notifier import TelegramNotifier
 
 log = logging.getLogger("bot")
@@ -61,17 +63,23 @@ def run() -> None:
     except TelegramUnauthorizedError:
         log.error("Бот не смог запуститься: Telegram не принял токен (Unauthorized) — проверьте строку BOT_TOKEN в файле .env")
         sys.exit(1)
-    except TelegramNetworkError as e:
+    except TokenValidationError:
         log.error(
-            "Бот не смог запуститься: нет связи с сервером Telegram (%s). "
-            "Проверьте интернет или строки TELEGRAM_API_URL / TELEGRAM_PROXY в файле .env",
-            type(e).__name__,
+            "Бот не смог запуститься: токен в строке BOT_TOKEN файла .env записан неверно "
+            "(лишние кавычки, пробелы или текст) — должно быть BOT_TOKEN=1234567890:AAH…"
         )
         sys.exit(1)
     except (KeyboardInterrupt, SystemExit):
         raise
-    except Exception:
-        log.exception("Бот не смог запуститься")
+    except Exception as e:
+        if is_transport_error(e):
+            log.error(
+                "Бот не смог запуститься: нет связи с сервером Telegram (%s). "
+                "Проверьте интернет или строки TELEGRAM_API_URL / TELEGRAM_PROXY в файле .env",
+                type(e).__name__,
+            )
+        else:
+            log.exception("Бот не смог запуститься")
         sys.exit(1)
 
 

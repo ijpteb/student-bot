@@ -21,6 +21,14 @@ from bot.telegram.ui import answer_cb, show
 
 router = Router(name="common")
 
+# Слова, которыми студенты пытаются выйти из ввода вместо кнопки «✖️ Отмена».
+CANCEL_WORDS = {"отмена", "отменить", "назад", "стоп", "выход", "выйти", "cancel"}
+# Сообщения, которые пишет сам студент (а не служебные: закрепление, таймер удаления и т. п.).
+USER_CONTENT = (
+    F.text | F.photo | F.document | F.video | F.voice | F.audio | F.sticker | F.video_note
+    | F.animation | F.location | F.contact | F.poll | F.dice | F.venue
+)
+
 HELP = (
     "<b>Что умеет бот</b>\n\n"
     "📅 <b>Расписание</b> — на сегодня, завтра, неделю и ближайшая пара. "
@@ -111,6 +119,12 @@ async def cancel_cmd(message: Message, state: FSMContext) -> None:
     await message.answer("Отменено.", reply_markup=kb.main_menu())
 
 
+@router.message(StateFilter("*"), F.text, F.text.func(lambda t: t.strip().lower().rstrip(".!") in CANCEL_WORDS))
+async def cancel_word(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("Отменено.", reply_markup=kb.main_menu())
+
+
 @router.callback_query(kb.Nav.filter(F.to == "cancel"), StateFilter("*"))
 async def cancel_cb(cb: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
@@ -162,8 +176,24 @@ async def fallback(message: Message) -> None:
     await message.answer("Не понял 🙂 Выберите действие в меню внизу или нажмите /help.", reply_markup=kb.main_menu())
 
 
+# Альбом приходит отдельными сообщениями — на него отвечаем один раз, а не на каждое фото.
+_answered_album: dict[int, str] = {}
+
+
+def _first_of_album(message: Message) -> bool:
+    group = message.media_group_id
+    if not group:
+        return True
+    if _answered_album.get(message.chat.id) == group:
+        return False
+    _answered_album[message.chat.id] = group
+    return True
+
+
 @fallback_router.message(StateFilter(None), F.photo | F.document)
 async def fallback_file(message: Message) -> None:
+    if not _first_of_album(message):
+        return
     await message.answer(
         "Чтобы сохранить фото или файл как задание, нажмите «➕ Задание» и пришлите его, "
         "когда я попрошу текст задания.",
@@ -171,26 +201,35 @@ async def fallback_file(message: Message) -> None:
     )
 
 
-@fallback_router.message(StateFilter(None))
+@fallback_router.message(StateFilter(None), USER_CONTENT)
 async def fallback_other(message: Message) -> None:
+    if not _first_of_album(message):
+        return
     await message.answer("Не понял 🙂 Выберите действие в меню внизу или нажмите /help.", reply_markup=kb.main_menu())
 
 
-@fallback_router.message()
+@fallback_router.message(USER_CONTENT)
 async def fallback_in_dialog(message: Message) -> None:
     """Посреди диалога пришло то, чего этот шаг не ждёт."""
+    if not _first_of_album(message):
+        return
     if message.text and message.text.startswith("/"):
         await message.answer("Такой команды нет. Выйти из ввода — /cancel, список команд — /help.")
     elif message.text:
         await message.answer("Не понял 🙂 Ответьте на вопрос выше или нажмите «✖️ Отмена».")
+    elif message.photo or message.document:
+        await message.answer(
+            "Это фото или файл не сохранено: сейчас я жду ответ на вопрос выше. "
+            "Фото и файлы можно прислать, когда я попрошу текст задания (и на следующих шагах)."
+        )
     else:
         await message.answer(
-            "Сейчас я жду ответ на вопрос выше — текстом или кнопкой. "
-            "Видео, голосовые и стикеры сохранить не получится. Выйти из ввода — /cancel."
+            "Видео, голосовые и стикеры сохранить не получится. "
+            "Ответьте на вопрос выше текстом или кнопкой. Выйти из ввода — /cancel."
         )
 
 
 @fallback_router.callback_query()
 async def stale_button(cb: CallbackQuery) -> None:
     """Кнопка из старого сообщения или из уже пройденного шага."""
-    await answer_cb(cb, "Эта кнопка уже не действует. Начните заново из меню.")
+    await answer_cb(cb, "Эта кнопка уже не действует (действие выполнено или устарело).")

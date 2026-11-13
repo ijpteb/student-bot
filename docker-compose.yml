@@ -19,7 +19,9 @@ services:
   bot:
     build: .
     restart: unless-stopped
-    env_file: .env
+    env_file:
+      - path: .env
+        required: false  # чтобы «Остановить бота» работал, даже если .env потерялся
     environment:
       DATABASE_URL: postgresql+asyncpg://bot:${POSTGRES_PASSWORD}@db:5432/bot
     depends_on:
